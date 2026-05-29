@@ -2215,6 +2215,7 @@ class FileSwitchManager(object):
         self.cache_path = os.path.join(os.getenv('APPDATA', '.'), 'syncplay_media_cache.json')
         self.mediaFilesCache = {}
         self.lock = threading.Lock()
+        self.active_deep_searches = set()
         
         # Asynchronously load cache in a background thread to prevent GUI startup blocking
         threading.Thread(target=self._load_cache_async, daemon=True).start()
@@ -2470,18 +2471,44 @@ class FileSwitchManager(object):
 
         # Fallback: Run targeted on-demand deep search
         if self.folderSearchEnabled and self.mediaDirectories is not None:
-            found_dir, files_list = self.deep_search_file(self.mediaDirectories, filename)
-            if found_dir:
+            if highPriority:
+                # Synchronous search for immediate user action
+                found_dir, files_list = self.deep_search_file(self.mediaDirectories, filename)
+                if found_dir:
+                    with self.lock:
+                        self.mediaFilesCache[found_dir] = files_list
+                    self.save_cache()
+                    self.newInfo = True
+                    self.checkForFileSwitchUpdate()
+                    
+                    filepath = os.path.join(found_dir, filename)
+                    if os.path.isfile(filepath):
+                        self.log(f"findFilepath SUCCESS: Synchronous high-priority deep search resolved in '{found_dir}'. Returned path: '{filepath}' in {time.time() - start_time:.4f}s")
+                        return filepath
+            else:
+                # Asynchronous background search for UI refreshing
                 with self.lock:
-                    self.mediaFilesCache[found_dir] = files_list
-                self.save_cache()
-                self.newInfo = True
-                self.checkForFileSwitchUpdate()
+                    already_searching = filename in self.active_deep_searches
                 
-                filepath = os.path.join(found_dir, filename)
-                if os.path.isfile(filepath):
-                    self.log(f"findFilepath SUCCESS: On-Demand Lazy Deep Search hit resolved in '{found_dir}'. Returned path: '{filepath}' in {time.time() - start_time:.4f}s")
-                    return filepath
+                if not already_searching:
+                    with self.lock:
+                        self.active_deep_searches.add(filename)
+                    self.log(f"findFilepath: Spawning background deep search for '{filename}'")
+                    
+                    def async_search():
+                        try:
+                            found_dir, files_list = self.deep_search_file(self.mediaDirectories, filename)
+                            if found_dir:
+                                with self.lock:
+                                    self.mediaFilesCache[found_dir] = files_list
+                                self.save_cache()
+                                self.newInfo = True
+                                reactor.callFromThread(self.checkForFileSwitchUpdate)
+                        finally:
+                            with self.lock:
+                                self.active_deep_searches.discard(filename)
+                    
+                    threading.Thread(target=async_search, daemon=True).start()
 
         self.log(f"findFilepath FAILED: Could not resolve '{filename}' after {time.time() - start_time:.4f}s")
 
