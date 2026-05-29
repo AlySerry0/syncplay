@@ -2213,18 +2213,15 @@ class FileSwitchManager(object):
     def __init__(self, client):
         self._client = client
         self.cache_path = os.path.join(os.getenv('APPDATA', '.'), 'syncplay_media_cache.json')
-        start_time = time.time()
-        try:
-            with open(self.cache_path, 'r', encoding='utf-8') as f:
-                self.mediaFilesCache = json.load(f)
-            self.log(f"Cache loaded successfully in {time.time() - start_time:.4f}s from {self.cache_path}. Cached directories: {len(self.mediaFilesCache)}")
-        except Exception as e:
-            self.mediaFilesCache = {}
-            self.log(f"Cache load failed or file missing. Initialized empty cache. Details: {e}")
+        self.mediaFilesCache = {}
+        self.lock = threading.Lock()
+        
+        # Asynchronously load cache in a background thread to prevent GUI startup blocking
+        threading.Thread(target=self._load_cache_async, daemon=True).start()
+        
         self.filenameWatchlist = []
         self.currentDirectory = None
         self.mediaDirectories = client.getConfig().get('mediaSearchDirectories')
-        self.lock = threading.Lock()
         self.folderSearchEnabled = True
         self.directorySearchError = None
         self.newInfo = False
@@ -2233,6 +2230,37 @@ class FileSwitchManager(object):
         self.fileSwitchTimer = task.LoopingCall(self.updateInfo)
         self.fileSwitchTimer.start(constants.FOLDER_SEARCH_DOUBLE_CHECK_INTERVAL, True)
         self.mediaDirectoriesNotFound = []
+
+    def _load_cache_async(self):
+        start_time = time.time()
+        try:
+            if os.path.exists(self.cache_path):
+                with open(self.cache_path, 'r', encoding='utf-8') as f:
+                    loaded_cache = json.load(f)
+                with self.lock:
+                    self.mediaFilesCache = loaded_cache
+                self.log(f"Cache loaded asynchronously in {time.time() - start_time:.4f}s from {self.cache_path}. Cached directories: {len(self.mediaFilesCache)}")
+            else:
+                self.log("Cache file does not exist. Initialized empty cache.")
+        except Exception as e:
+            self.log(f"Asynchronous cache load failed. Details: {e}")
+
+    def save_cache(self):
+        try:
+            with self.lock:
+                cache_copy = dict(self.mediaFilesCache)
+            
+            def save_task():
+                try:
+                    with open(self.cache_path, 'w', encoding='utf-8') as f:
+                        json.dump(cache_copy, f, indent=4, ensure_ascii=False)
+                    self.log(f"Persistent JSON cache saved asynchronously. Total directories: {len(cache_copy)}")
+                except Exception as e:
+                    self.log(f"Failed to save JSON cache asynchronously: {e}")
+
+            threading.Thread(target=save_task, daemon=True).start()
+        except Exception as e:
+            self.log(f"Failed to initiate asynchronous cache save: {e}")
 
     def setClient(self, newClient):
         self._client = newClient
@@ -2356,12 +2384,7 @@ class FileSwitchManager(object):
                     if self.mediaFilesCache != newMediaFilesCache:
                         self.mediaFilesCache = newMediaFilesCache
                         self.newInfo = True
-                        try:
-                            with open(self.cache_path, 'w', encoding='utf-8') as f:
-                                json.dump(self.mediaFilesCache, f, indent=4, ensure_ascii=False)
-                            self.log(f"Persistent JSON cache updated on disk. Total directories now: {len(self.mediaFilesCache)}")
-                        except Exception as e:
-                            self.log(f"Failed to write persistent JSON cache: {e}")
+                        self.save_cache()
             except Exception as e:
                 self._client.ui.showDebugMessage(str(e))
             finally:
@@ -2428,8 +2451,9 @@ class FileSwitchManager(object):
             return path
 
         if self.mediaFilesCache is not None:
-            for directory in self.mediaFilesCache:
-                files = self.mediaFilesCache[directory]
+            with self.lock:
+                cache_items = list(self.mediaFilesCache.items())
+            for directory, files in cache_items:
                 if len(files) > 0 and filename in files:
                     filepath = os.path.join(directory, filename)
                     if os.path.isfile(filepath):
@@ -2448,13 +2472,9 @@ class FileSwitchManager(object):
         if self.folderSearchEnabled and self.mediaDirectories is not None:
             found_dir, files_list = self.deep_search_file(self.mediaDirectories, filename)
             if found_dir:
-                self.mediaFilesCache[found_dir] = files_list
-                try:
-                    with open(self.cache_path, 'w', encoding='utf-8') as f:
-                        json.dump(self.mediaFilesCache, f, indent=4, ensure_ascii=False)
-                    self.log(f"Persistent JSON cache updated on disk via targeted fallback. Total directories now: {len(self.mediaFilesCache)}")
-                except Exception as e:
-                    self.log(f"Failed to write persistent JSON cache: {e}")
+                with self.lock:
+                    self.mediaFilesCache[found_dir] = files_list
+                self.save_cache()
                 self.newInfo = True
                 self.checkForFileSwitchUpdate()
                 
