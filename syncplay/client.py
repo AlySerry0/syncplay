@@ -4,6 +4,7 @@ import collections
 import hashlib
 import os
 import os.path
+import json
 import random
 import re
 import sys
@@ -2202,7 +2203,12 @@ class SyncplayPlaylist():
 class FileSwitchManager(object):
     def __init__(self, client):
         self._client = client
-        self.mediaFilesCache = {}
+        self.cache_path = os.path.join(os.getenv('APPDATA', '.'), 'syncplay_media_cache.json')
+        try:
+            with open(self.cache_path, 'r', encoding='utf-8') as f:
+                self.mediaFilesCache = json.load(f)
+        except Exception:
+            self.mediaFilesCache = {}
         self.filenameWatchlist = []
         self.currentDirectory = None
         self.mediaDirectories = client.getConfig().get('mediaSearchDirectories')
@@ -2286,22 +2292,55 @@ class FileSwitchManager(object):
                     fileCount = 0
                     lastWarningTime = None
                     for directory in dirsToSearch:
-                        for root, dirs, files in os.walk(directory):
-                            fileCount += 1
-                            newMediaFilesCache[root] = files
-                            timeTakenSoFar = time.time() - startTime
-                            if timeTakenSoFar > constants.FOLDER_SEARCH_TIMEOUT:
-                                reactor.callLater(0.1, self._client.ui.showErrorMessage, getMessage("folder-search-timeout-error").format(directory, fileCount),False)
-                                self.folderSearchEnabled = False
-                                return
-                            if timeTakenSoFar > constants.FOLDER_SEARCH_WARNING_THRESHOLD:
-                                if not lastWarningTime or timeTakenSoFar - lastWarningTime >= 1:
-                                    reactor.callLater(0.1, self._client.ui.showErrorMessage, getMessage("folder-search-timeout-warning").format(int(timeTakenSoFar), fileCount, directory),False)
-                                    lastWarningTime = timeTakenSoFar
+                        queue = [(directory, 0)]
+                        while queue:
+                            current_dir, depth = queue.pop(0)
+                            try:
+                                files_list = []
+                                subdirs_list = []
+                                with os.scandir(current_dir) as it:
+                                    for entry in it:
+                                        if not self.folderSearchEnabled:
+                                            return
+                                        name = entry.name
+                                        if name.startswith('.'):
+                                            continue
+                                        try:
+                                            if entry.is_dir(follow_symlinks=False):
+                                                if name.lower() not in constants.FOLDER_SEARCH_IGNORED_NAMES:
+                                                    subdirs_list.append(entry.path)
+                                            elif entry.is_file(follow_symlinks=False):
+                                                files_list.append(name)
+                                        except OSError:
+                                            pass
+
+                                newMediaFilesCache[current_dir] = files_list
+                                fileCount += 1
+
+                                timeTakenSoFar = time.time() - startTime
+                                if timeTakenSoFar > constants.FOLDER_SEARCH_TIMEOUT:
+                                    reactor.callLater(0.1, self._client.ui.showErrorMessage, getMessage("folder-search-timeout-error").format(directory, fileCount), False)
+                                    self.folderSearchEnabled = False
+                                    return
+                                if timeTakenSoFar > constants.FOLDER_SEARCH_WARNING_THRESHOLD:
+                                    if not lastWarningTime or timeTakenSoFar - lastWarningTime >= 1:
+                                        reactor.callLater(0.1, self._client.ui.showErrorMessage, getMessage("folder-search-timeout-warning").format(int(timeTakenSoFar), fileCount, directory), False)
+                                        lastWarningTime = timeTakenSoFar
+
+                                if depth < 2:
+                                    for subdir in subdirs_list:
+                                        queue.append((subdir, depth + 1))
+                            except OSError:
+                                pass
 
                     if self.mediaFilesCache != newMediaFilesCache:
                         self.mediaFilesCache = newMediaFilesCache
                         self.newInfo = True
+                        try:
+                            with open(self.cache_path, 'w', encoding='utf-8') as f:
+                                json.dump(self.mediaFilesCache, f, indent=4, ensure_ascii=False)
+                        except Exception:
+                            pass
             except Exception as e:
                 self._client.ui.showDebugMessage(str(e))
             finally:
@@ -2309,6 +2348,42 @@ class FileSwitchManager(object):
 
     def infoUpdated(self):
         self._client.fileSwitchFoundFiles()
+
+    def deep_search_file(self, directories, target_filename):
+        ignored_names = {
+            '$recycle.bin', 'system volume information', '.git', '.github', '.syncplay',
+            'node_modules', 'venv', '.venv', 'pycache', '__pycache__', 'appdata',
+            'library', 'caches', '.sync', '@eadir', '#recycle'
+        }
+        for root_dir in directories:
+            queue = [root_dir]
+            while queue:
+                current_dir = queue.pop(0)
+                try:
+                    files_list = []
+                    subdirs_list = []
+                    with os.scandir(current_dir) as it:
+                        for entry in it:
+                            name = entry.name
+                            if name.startswith('.'):
+                                continue
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    if name.lower() not in ignored_names:
+                                        subdirs_list.append(entry.path)
+                                elif entry.is_file(follow_symlinks=False):
+                                    files_list.append(name)
+                            except OSError:
+                                pass
+                    
+                    if target_filename in files_list:
+                        return current_dir, files_list
+                        
+                    for subdir in subdirs_list:
+                        queue.append(subdir)
+                except OSError:
+                    pass
+        return None, None
 
     def findFilepath(self, filename, highPriority=False):
         if filename is None:
@@ -2329,6 +2404,23 @@ class FileSwitchManager(object):
             directoryList = self.mediaDirectories
             for directory in directoryList:
                 filepath = os.path.join(directory, filename)
+                if os.path.isfile(filepath):
+                    return filepath
+
+        # Fallback: Run targeted on-demand deep search
+        if self.folderSearchEnabled and self.mediaDirectories is not None:
+            found_dir, files_list = self.deep_search_file(self.mediaDirectories, filename)
+            if found_dir:
+                self.mediaFilesCache[found_dir] = files_list
+                try:
+                    with open(self.cache_path, 'w', encoding='utf-8') as f:
+                        json.dump(self.mediaFilesCache, f, indent=4, ensure_ascii=False)
+                except Exception:
+                    pass
+                self.newInfo = True
+                self.checkForFileSwitchUpdate()
+                
+                filepath = os.path.join(found_dir, filename)
                 if os.path.isfile(filepath):
                     return filepath
 
