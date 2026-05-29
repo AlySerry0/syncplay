@@ -888,8 +888,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _isTryingToChangeToCurrentFile(self, filename):
         if self._syncplayClient.userlist.currentUser.file and filename == self._syncplayClient.userlist.currentUser.file["name"]:
-            self.showDebugMessage("File change request ignored (Syncplay should not be asked to change to current filename)")
-            return True
+            currentPath = self._syncplayClient.userlist.currentUser.file.get("path")
+            if currentPath and os.path.exists(currentPath):
+                resolvedPath = self._syncplayClient.fileSwitch.findFilepath(filename)
+                if resolvedPath and os.path.normpath(resolvedPath) != os.path.normpath(currentPath):
+                    return False
+                self.showDebugMessage("File change request ignored (Syncplay should not be asked to change to current filename)")
+                return True
+            else:
+                return False
         else:
             return False
 
