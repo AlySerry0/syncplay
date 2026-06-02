@@ -605,10 +605,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 getMessage("duration-heading-label"), getMessage("filename-heading-label")
             ))
         usertreeRoot = self._usertreebuffer.invisibleRootItem()
+        current_file_path = self._syncplayClient.userlist.currentUser.file["path"] if self._syncplayClient.userlist.currentUser.file else None
+        fileSwitch = getattr(self._syncplayClient, 'fileSwitch', None)
+        is_local_file = False
+        if current_file_path:
+            if fileSwitch and hasattr(fileSwitch, '_cached_isfile'):
+                is_local_file = fileSwitch._cached_isfile(current_file_path)
+            else:
+                is_local_file = os.path.isfile(current_file_path)
+
         if (
             self._syncplayClient.userlist.currentUser.file and
-            self._syncplayClient.userlist.currentUser.file and
-            os.path.isfile(self._syncplayClient.userlist.currentUser.file["path"])
+            is_local_file
         ):
             self._syncplayClient.fileSwitch.setCurrentDirectory(os.path.dirname(self._syncplayClient.userlist.currentUser.file["path"]))
 
@@ -889,12 +897,22 @@ class MainWindow(QtWidgets.QMainWindow):
     def _isTryingToChangeToCurrentFile(self, filename):
         if self._syncplayClient.userlist.currentUser.file and filename == self._syncplayClient.userlist.currentUser.file["name"]:
             currentPath = self._syncplayClient.userlist.currentUser.file.get("path")
-            if currentPath and os.path.exists(currentPath):
-                resolvedPath = self._syncplayClient.fileSwitch.findFilepath(filename)
-                if resolvedPath and os.path.normpath(resolvedPath) != os.path.normpath(currentPath):
+            if currentPath:
+                fileSwitch = getattr(self._syncplayClient, 'fileSwitch', None)
+                exists_check = False
+                if fileSwitch and hasattr(fileSwitch, '_cached_exists'):
+                    exists_check = fileSwitch._cached_exists(currentPath)
+                else:
+                    exists_check = os.path.exists(currentPath)
+                
+                if exists_check:
+                    resolvedPath = self._syncplayClient.fileSwitch.findFilepath(filename)
+                    if resolvedPath and os.path.normpath(resolvedPath) != os.path.normpath(currentPath):
+                        return False
+                    self.showDebugMessage("File change request ignored (Syncplay should not be asked to change to current filename)")
+                    return True
+                else:
                     return False
-                self.showDebugMessage("File change request ignored (Syncplay should not be asked to change to current filename)")
-                return True
             else:
                 return False
         else:

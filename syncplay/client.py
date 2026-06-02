@@ -2217,6 +2217,10 @@ class FileSwitchManager(object):
         self.lock = threading.Lock()
         self.active_deep_searches = set()
         
+        # Short-TTL cache to make repeated existence checks instantaneous on network drives
+        self._exist_cache = {}      # {filepath: (bool, timestamp)}
+        self._EXIST_TTL = 2.0
+        
         # Asynchronously load cache in a background thread to prevent GUI startup blocking
         threading.Thread(target=self._load_cache_async, daemon=True).start()
         
@@ -2245,6 +2249,28 @@ class FileSwitchManager(object):
                 self.log("Cache file does not exist. Initialized empty cache.")
         except Exception as e:
             self.log(f"Asynchronous cache load failed. Details: {e}")
+
+    def _cached_isfile(self, filepath):
+        now = time.time()
+        with self.lock:
+            entry = self._exist_cache.get(filepath)
+        if entry and now - entry[1] < self._EXIST_TTL:
+            return entry[0]
+        result = os.path.isfile(filepath)
+        with self.lock:
+            self._exist_cache[filepath] = (result, now)
+        return result
+
+    def _cached_exists(self, filepath):
+        now = time.time()
+        with self.lock:
+            entry = self._exist_cache.get(filepath)
+        if entry and now - entry[1] < self._EXIST_TTL:
+            return entry[0]
+        result = os.path.exists(filepath)
+        with self.lock:
+            self._exist_cache[filepath] = (result, now)
+        return result
 
     def save_cache(self):
         try:
@@ -2279,7 +2305,8 @@ class FileSwitchManager(object):
         self.setMediaDirectories(mediaDirs)
         if mediaDirs == "":
             self._client.ui.showErrorMessage(getMessage("no-media-directories-error"))
-            self.mediaFilesCache = {}
+            with self.lock:
+                self.mediaFilesCache = {}
             self.newInfo = True
             self.checkForFileSwitchUpdate()
 
@@ -2303,93 +2330,99 @@ class FileSwitchManager(object):
         self.filenameWatchlist = unfoundFilenames
 
     def _updateInfoThread(self):
-        with self.lock:
-            try:
-                self.currentlyUpdating = True
-                dirsToSearch = self.mediaDirectories
+        try:
+            self.currentlyUpdating = True
+            dirsToSearch = self.mediaDirectories
 
-                if not self.folderSearchEnabled:
-                    return
+            if not self.folderSearchEnabled:
+                return
 
-                if dirsToSearch:
-                    # Spin up hard drives to prevent premature timeout
-                    randomFilename = "RandomFile"+str(random.randrange(10000, 99999))+".txt"
-                    for directory in dirsToSearch:
-                        if not os.path.isdir(directory):
-                            self.directorySearchError = getMessage("cannot-find-directory-error").format(directory)
+            if dirsToSearch:
+                # Spin up hard drives to prevent premature timeout
+                randomFilename = "RandomFile"+str(random.randrange(10000, 99999))+".txt"
+                for directory in dirsToSearch:
+                    if not os.path.isdir(directory):
+                        self.directorySearchError = getMessage("cannot-find-directory-error").format(directory)
 
-                        startTime = time.time()
-                        if os.path.isfile(os.path.join(directory, randomFilename)):
-                            randomFilename = "RandomFile"+str(random.randrange(10000, 99999))+".txt"
-                            print("Found random file (?)")
-                        if time.time() - startTime > constants.FOLDER_SEARCH_FIRST_FILE_TIMEOUT:
-                            self.folderSearchEnabled = False
-                            self.directorySearchError = getMessage("folder-search-first-file-timeout-error").format(directory)
-                            return
-
-                    # Actual directory search
-                    newMediaFilesCache = {}
                     startTime = time.time()
-                    self.log(f"Background BFS shallow scan started. Roots to search: {dirsToSearch}")
-                    fileCount = 0
-                    dirCount = 0
-                    lastWarningTime = None
-                    for directory in dirsToSearch:
-                        queue = [(directory, 0)]
-                        while queue:
-                            current_dir, depth = queue.pop(0)
-                            try:
-                                files_list = []
-                                subdirs_list = []
-                                with os.scandir(current_dir) as it:
-                                    for entry in it:
-                                        if not self.folderSearchEnabled:
-                                            self.log("Background BFS scan aborted (folderSearchEnabled is False)")
-                                            return
-                                        name = entry.name
-                                        if name.startswith('.'):
-                                            continue
-                                        try:
-                                            if entry.is_dir(follow_symlinks=False):
-                                                if name.lower() not in constants.FOLDER_SEARCH_IGNORED_NAMES:
-                                                    subdirs_list.append(entry.path)
-                                            elif entry.is_file(follow_symlinks=False):
-                                                files_list.append(name)
-                                        except OSError as oe:
-                                            self.log(f"OS error scanning entry {name} in {current_dir}: {oe}")
-                                            pass
+                    if os.path.isfile(os.path.join(directory, randomFilename)):
+                        randomFilename = "RandomFile"+str(random.randrange(10000, 99999))+".txt"
+                        print("Found random file (?)")
+                    if time.time() - startTime > constants.FOLDER_SEARCH_FIRST_FILE_TIMEOUT:
+                        self.folderSearchEnabled = False
+                        self.directorySearchError = getMessage("folder-search-first-file-timeout-error").format(directory)
+                        return
 
-                                newMediaFilesCache[current_dir] = files_list
-                                fileCount += len(files_list)
-                                dirCount += 1
+                # Actual directory search
+                newMediaFilesCache = {}
+                startTime = time.time()
+                self.log(f"Background BFS shallow scan started. Roots to search: {dirsToSearch}")
+                fileCount = 0
+                dirCount = 0
+                lastWarningTime = None
+                for directory in dirsToSearch:
+                    queue = [(directory, 0)]
+                    while queue:
+                        current_dir, depth = queue.pop(0)
+                        try:
+                            files_list = []
+                            subdirs_list = []
+                            with os.scandir(current_dir) as it:
+                                for entry in it:
+                                    if not self.folderSearchEnabled:
+                                        self.log("Background BFS scan aborted (folderSearchEnabled is False)")
+                                        return
+                                    name = entry.name
+                                    if name.startswith('.'):
+                                        continue
+                                    try:
+                                        if entry.is_dir(follow_symlinks=False):
+                                            if name.lower() not in constants.FOLDER_SEARCH_IGNORED_NAMES:
+                                                subdirs_list.append(entry.path)
+                                        elif entry.is_file(follow_symlinks=False):
+                                            files_list.append(name)
+                                    except OSError as oe:
+                                        self.log(f"OS error scanning entry {name} in {current_dir}: {oe}")
+                                        pass
 
-                                timeTakenSoFar = time.time() - startTime
-                                if timeTakenSoFar > constants.FOLDER_SEARCH_TIMEOUT:
-                                    self.log(f"Background BFS scan timed out after {timeTakenSoFar:.2f}s in {current_dir}")
-                                    reactor.callLater(0.1, self._client.ui.showErrorMessage, getMessage("folder-search-timeout-error").format(directory, fileCount), False)
-                                    self.folderSearchEnabled = False
-                                    return
-                                if timeTakenSoFar > constants.FOLDER_SEARCH_WARNING_THRESHOLD:
-                                    if not lastWarningTime or timeTakenSoFar - lastWarningTime >= 1:
-                                        reactor.callLater(0.1, self._client.ui.showErrorMessage, getMessage("folder-search-timeout-warning").format(int(timeTakenSoFar), fileCount, directory), False)
-                                        lastWarningTime = timeTakenSoFar
+                            newMediaFilesCache[current_dir] = files_list
+                            fileCount += len(files_list)
+                            dirCount += 1
 
-                                if depth < 2:
-                                    for subdir in subdirs_list:
-                                        queue.append((subdir, depth + 1))
-                            except OSError as oe:
-                                self.log(f"OS error opening directory {current_dir}: {oe}")
-                                pass
+                            timeTakenSoFar = time.time() - startTime
+                            if timeTakenSoFar > constants.FOLDER_SEARCH_TIMEOUT:
+                                self.log(f"Background BFS scan timed out after {timeTakenSoFar:.2f}s in {current_dir}")
+                                reactor.callFromThread(self._client.ui.showErrorMessage, getMessage("folder-search-timeout-error").format(directory, fileCount), False)
+                                self.folderSearchEnabled = False
+                                return
+                            if timeTakenSoFar > constants.FOLDER_SEARCH_WARNING_THRESHOLD:
+                                if not lastWarningTime or timeTakenSoFar - lastWarningTime >= 1:
+                                    reactor.callFromThread(self._client.ui.showErrorMessage, getMessage("folder-search-timeout-warning").format(int(timeTakenSoFar), fileCount, directory), False)
+                                    lastWarningTime = timeTakenSoFar
 
-                    self.log(f"Background BFS shallow scan finished in {time.time() - startTime:.4f}s. Visited {dirCount} directories, cached {fileCount} total files.")
-                    if self.mediaFilesCache != newMediaFilesCache:
-                        self.mediaFilesCache = newMediaFilesCache
+                            if depth < 2:
+                                for subdir in subdirs_list:
+                                    queue.append((subdir, depth + 1))
+                        except OSError as oe:
+                            self.log(f"OS error opening directory {current_dir}: {oe}")
+                            pass
+
+                self.log(f"Background BFS shallow scan finished in {time.time() - startTime:.4f}s. Visited {dirCount} directories, cached {fileCount} total files.")
+                
+                # Merge fresh shallow scan data into persistent memory dictionary (Claude review merge fix)
+                with self.lock:
+                    merged = dict(self.mediaFilesCache)
+                    merged.update(newMediaFilesCache)
+                    if merged != self.mediaFilesCache:
+                        self.mediaFilesCache = merged
                         self.newInfo = True
-                        self.save_cache()
-            except Exception as e:
-                self._client.ui.showDebugMessage(str(e))
-            finally:
-                self.currentlyUpdating = False
+                
+                if self.newInfo:
+                    self.save_cache()
+        except Exception as e:
+            self._client.ui.showDebugMessage(str(e))
+        finally:
+            self.currentlyUpdating = False
 
     def infoUpdated(self):
         self._client.fileSwitchFoundFiles()
@@ -2397,11 +2430,6 @@ class FileSwitchManager(object):
     def deep_search_file(self, directories, target_filename):
         self.log(f"Lazy On-Demand Deep Search triggered for filename: '{target_filename}' under roots: {directories}")
         start_time = time.time()
-        ignored_names = {
-            '$recycle.bin', 'system volume information', '.git', '.github', '.syncplay',
-            'node_modules', 'venv', '.venv', 'pycache', '__pycache__', 'appdata',
-            'library', 'caches', '.sync', '@eadir', '#recycle'
-        }
         dirs_scanned = 0
         for root_dir in directories:
             queue = [root_dir]
@@ -2418,7 +2446,7 @@ class FileSwitchManager(object):
                                 continue
                             try:
                                 if entry.is_dir(follow_symlinks=False):
-                                    if name.lower() not in ignored_names:
+                                    if name.lower() not in constants.FOLDER_SEARCH_IGNORED_NAMES:
                                         subdirs_list.append(entry.path)
                                 elif entry.is_file(follow_symlinks=False):
                                     files_list.append(name)
@@ -2457,7 +2485,7 @@ class FileSwitchManager(object):
             for directory, files in cache_items:
                 if len(files) > 0 and filename in files:
                     filepath = os.path.join(directory, filename)
-                    if os.path.isfile(filepath):
+                    if self._cached_isfile(filepath):
                         self.log(f"findFilepath SUCCESS: Local persistent cache hit found in directory '{directory}'. Returned path: '{filepath}' in {time.time() - start_time:.4f}s")
                         return filepath
 
@@ -2465,7 +2493,7 @@ class FileSwitchManager(object):
             directoryList = self.mediaDirectories
             for directory in directoryList:
                 filepath = os.path.join(directory, filename)
-                if os.path.isfile(filepath):
+                if self._cached_isfile(filepath):
                     self.log(f"findFilepath SUCCESS: Root/shallow directories direct hit in '{directory}'. Returned path: '{filepath}' in {time.time() - start_time:.4f}s")
                     return filepath
 
@@ -2482,33 +2510,31 @@ class FileSwitchManager(object):
                     self.checkForFileSwitchUpdate()
                     
                     filepath = os.path.join(found_dir, filename)
-                    if os.path.isfile(filepath):
-                        self.log(f"findFilepath SUCCESS: Synchronous high-priority deep search resolved in '{found_dir}'. Returned path: '{filepath}' in {time.time() - start_time:.4f}s")
-                        return filepath
+                    self.log(f"findFilepath SUCCESS: Synchronous high-priority deep search resolved in '{found_dir}'. Returned path: '{filepath}' in {time.time() - start_time:.4f}s")
+                    return filepath
             else:
                 # Asynchronous background search for UI refreshing
                 with self.lock:
-                    already_searching = filename in self.active_deep_searches
+                    if filename in self.active_deep_searches:
+                        return
+                    self.active_deep_searches.add(filename)
                 
-                if not already_searching:
-                    with self.lock:
-                        self.active_deep_searches.add(filename)
-                    self.log(f"findFilepath: Spawning background deep search for '{filename}'")
-                    
-                    def async_search():
-                        try:
-                            found_dir, files_list = self.deep_search_file(self.mediaDirectories, filename)
-                            if found_dir:
-                                with self.lock:
-                                    self.mediaFilesCache[found_dir] = files_list
-                                self.save_cache()
-                                self.newInfo = True
-                                reactor.callFromThread(self.checkForFileSwitchUpdate)
-                        finally:
+                self.log(f"findFilepath: Spawning background deep search for '{filename}'")
+                
+                def async_search():
+                    try:
+                        found_dir, files_list = self.deep_search_file(self.mediaDirectories, filename)
+                        if found_dir:
                             with self.lock:
-                                self.active_deep_searches.discard(filename)
-                    
-                    threading.Thread(target=async_search, daemon=True).start()
+                                self.mediaFilesCache[found_dir] = files_list
+                            self.save_cache()
+                            self.newInfo = True
+                            reactor.callFromThread(self.checkForFileSwitchUpdate)
+                    finally:
+                        with self.lock:
+                            self.active_deep_searches.discard(filename)
+                
+                threading.Thread(target=async_search, daemon=True).start()
 
         self.log(f"findFilepath FAILED: Could not resolve '{filename}' after {time.time() - start_time:.4f}s")
 
@@ -2520,15 +2546,18 @@ class FileSwitchManager(object):
 
     def isFilenameInCache(self, filename):
         if filename is not None and self.mediaFilesCache is not None:
-            for directory in self.mediaFilesCache:
-                files = self.mediaFilesCache[directory]
+            with self.lock:
+                cache_snapshot = list(self.mediaFilesCache.items())
+            for directory, files in cache_snapshot:
                 if filename in files:
                     return True
+        return False
 
     def getDirectoryOfFilenameInCache(self, filename):
         if filename is not None and self.mediaFilesCache is not None:
-            for directory in self.mediaFilesCache:
-                files = self.mediaFilesCache[directory]
+            with self.lock:
+                cache_snapshot = list(self.mediaFilesCache.items())
+            for directory, files in cache_snapshot:
                 if filename in files:
                     return directory
         return None
@@ -2547,13 +2576,15 @@ class FileSwitchManager(object):
         if directoryToFind in self.mediaDirectoriesNotFound:
             return
         if self.mediaDirectories is not None and self.mediaFilesCache is not None:
-            if directoryToFind in self.mediaFilesCache:
+            with self.lock:
+                cache_snapshot = list(self.mediaFilesCache.items())
+                cache_keys = list(self.mediaFilesCache.keys())
+            if directoryToFind in cache_keys:
                 return
-            for directory in self.mediaFilesCache:
-                files = self.mediaFilesCache[directory]
+            for directory, files in cache_snapshot:
                 if filenameToFind in files:
                     return
-                if directoryToFind in self.mediaFilesCache:
+                if directoryToFind in cache_keys:
                     return
         if self.isDirectoryInList(directoryToFind, self.mediaDirectories):
             return
