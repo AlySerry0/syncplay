@@ -2349,8 +2349,7 @@ class FileSwitchManager(object):
                         randomFilename = "RandomFile"+str(random.randrange(10000, 99999))+".txt"
                         print("Found random file (?)")
                     if time.time() - startTime > constants.FOLDER_SEARCH_FIRST_FILE_TIMEOUT:
-                        self.folderSearchEnabled = False
-                        self.directorySearchError = getMessage("folder-search-first-file-timeout-error").format(directory)
+                        self.log(f"Hard drive spin up timeout for directory {directory} during first file search. Skipping this scan pass.")
                         return
 
                 # Actual directory search
@@ -2391,13 +2390,12 @@ class FileSwitchManager(object):
 
                             timeTakenSoFar = time.time() - startTime
                             if timeTakenSoFar > constants.FOLDER_SEARCH_TIMEOUT:
-                                self.log(f"Background BFS scan timed out after {timeTakenSoFar:.2f}s in {current_dir}")
-                                reactor.callFromThread(self._client.ui.showErrorMessage, getMessage("folder-search-timeout-error").format(directory, fileCount), False)
-                                self.folderSearchEnabled = False
+                                self.log(f"Background BFS scan timed out after {timeTakenSoFar:.2f}s in {current_dir}. Aborting this pass but keeping scanner enabled.")
                                 return
                             if timeTakenSoFar > constants.FOLDER_SEARCH_WARNING_THRESHOLD:
                                 if not lastWarningTime or timeTakenSoFar - lastWarningTime >= 1:
-                                    reactor.callFromThread(self._client.ui.showErrorMessage, getMessage("folder-search-timeout-warning").format(int(timeTakenSoFar), fileCount, directory), False)
+                                    # Log a non-disruptive warning instead of displaying a blocking popup
+                                    self.log(f"BFS Scan Warning: taken {int(timeTakenSoFar)}s, scanned {fileCount} files in {directory}")
                                     lastWarningTime = timeTakenSoFar
 
                             if depth < 2:
